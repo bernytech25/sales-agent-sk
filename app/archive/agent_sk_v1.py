@@ -1,5 +1,5 @@
 """
-Agente de análisis de ventas - Semantic Kernel + Azure OpenAI
+Agente de análisis de ventas - Semantic Kernel + Groq
 
 Diferencias clave con LangGraph:
 - No hay grafo manual — SK maneja el loop automáticamente
@@ -10,11 +10,6 @@ Diferencias clave con LangGraph:
 Flujo interno de SK:
   [START] → LLM decide → ejecuta función → LLM decide → ... → respuesta final
   (igual que LangGraph pero SK lo maneja internamente)
-
-Nota de migración: este archivo originalmente usaba Groq via el conector
-OpenAIChatCompletion (API compatible con OpenAI). La migración a Azure OpenAI
-solo cambió la sección de build_kernel() — el resto del agente (plugin, tools,
-manejo de historial, function calling) es exactamente el mismo código.
 """
 
 import os
@@ -22,7 +17,8 @@ import asyncio
 from dotenv import load_dotenv
 
 from semantic_kernel import Kernel
-from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
+from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
+from openai import AsyncOpenAI
 from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoiceBehavior
 from semantic_kernel.connectors.ai.open_ai.prompt_execution_settings.open_ai_prompt_execution_settings import (
     OpenAIChatPromptExecutionSettings,
@@ -43,33 +39,37 @@ Si la pregunta usa pronombres como el, ella, ese producto, revisa el historial
 e identifica a qué persona o producto se refiere, luego usa la función con ese nombre.
 Responde en español con insights accionables para el negocio."""
 
-SERVICE_ID = "azure-openai"
-
 
 # ── Construcción del Kernel ───────────────────────────────────────────────────
 
 def build_kernel() -> Kernel:
     """
-    Crea y configura el Kernel de Semantic Kernel conectado a Azure OpenAI.
+    Crea y configura el Kernel de Semantic Kernel.
 
-    Variables de entorno necesarias (.env):
-        AZURE_OPENAI_ENDPOINT     -> https://<tu-recurso>.openai.azure.com/
-        AZURE_OPENAI_KEY          -> Key 1 o Key 2 del recurso
-        AZURE_OPENAI_DEPLOYMENT   -> nombre del deployment (ej: gpt-4o-mini)
+    En producción con Azure OpenAI reemplazás OpenAIChatCompletion por:
+    from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
+    kernel.add_service(AzureChatCompletion(
+        deployment_name="gpt-4o",
+        endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_KEY"),
+    ))
     """
     kernel = Kernel()
 
+    # Conectar Groq via OpenAI compatible API
+    groq_client = AsyncOpenAI(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+    )
     kernel.add_service(
-        AzureChatCompletion(
-            service_id=SERVICE_ID,
-            deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
-            endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+        OpenAIChatCompletion(
+            ai_model_id=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            service_id="groq",
+            async_client=groq_client,
         )
     )
 
-    # Registrar el plugin con todas las tools (sin cambios respecto a Groq)
+    # Registrar el plugin con todas las tools
     kernel.add_plugin(SalesPlugin(), plugin_name="sales")
 
     return kernel
@@ -94,7 +94,7 @@ async def run_agent_async(question: str, history: list[dict] | None = None) -> s
     # FunctionChoiceBehavior.Auto() = el LLM decide cuándo llamar tools
     # Equivalente al edge condicional should_continue en LangGraph
     settings = OpenAIChatPromptExecutionSettings(
-        service_id=SERVICE_ID,
+        service_id="groq",
         function_choice_behavior=FunctionChoiceBehavior.Auto(),
         temperature=0,
     )
@@ -113,7 +113,7 @@ async def run_agent_async(question: str, history: list[dict] | None = None) -> s
     chat_history.add_user_message(question)
 
     # Invocar el agente
-    chat_service = kernel.get_service(SERVICE_ID)
+    chat_service = kernel.get_service("groq")
     response = await chat_service.get_chat_message_content(
         chat_history=chat_history,
         settings=settings,
