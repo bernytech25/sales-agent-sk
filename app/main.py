@@ -1,28 +1,43 @@
 """
-FastAPI - Sales Agent SK API
+FastAPI - Sales Agent SK API con autenticación JWT
 
-Endpoints:
-  GET  /                    → health check
-  GET  /ventas/resumen      → resumen general sin agente
-  POST /chat                → conversación con memoria in-session
-  POST /chat/persistent     → conversación con memoria persistente
-  GET  /memory/{session_id} → ver historial
-  DELETE /memory/{session_id} → limpiar historial
+Endpoints públicos:
+  GET  /              → health check
+  POST /auth/token    → obtener token JWT
+
+Endpoints protegidos (requieren Authorization: Bearer <token>):
+  GET  /ventas/resumen          → resumen general sin agente
+  POST /chat                    → conversación con memoria in-session
+  POST /chat/persistent         → conversación con memoria persistente
+  GET  /memory/{session_id}     → ver historial
+  DELETE /memory/{session_id}   → limpiar historial
 """
 
-from fastapi import FastAPI, HTTPException
+from typing import Annotated
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
 from app.agent_sk import run_agent
 from app.tools import resumen_general
 from app.memory import in_session_memory, persistent_memory
+from app.auth import (
+    Token,
+    User,
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 
 app = FastAPI(
     title="Sales Agent SK API",
-    description="Agente de análisis de ventas con Semantic Kernel + Groq + FastAPI",
-    version="1.0.0",
+    description="Agente de análisis de ventas con Semantic Kernel + Azure OpenAI + JWT Auth",
+    version="2.0.0",
 )
 
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -44,18 +59,47 @@ class ChatResponse(BaseModel):
     answer: str
 
 
+# ── Endpoints públicos ────────────────────────────────────────────────────────
+
 @app.get("/", tags=["Health"])
 def health():
-    return {"status": "ok", "service": "sales-agent-sk", "framework": "Semantic Kernel"}
+    return {"status": "ok", "service": "sales-agent-sk", "framework": "Semantic Kernel", "version": "2.0.0"}
 
+
+@app.post("/auth/token", response_model=Token, tags=["Autenticación"])
+def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    """
+    Obtiene un token JWT. Usuarios disponibles para demo:
+    - admin / admin123
+    - demo / demo123
+    """
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Usuario o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user.username})
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
+
+# ── Endpoints protegidos ──────────────────────────────────────────────────────
 
 @app.get("/ventas/resumen", tags=["Ventas"])
-def get_resumen():
+def get_resumen(current_user: Annotated[User, Depends(get_current_user)]):
     return resumen_general()
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Agente - Memoria In-Session"])
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest,
+    current_user: Annotated[User, Depends(get_current_user)]
+):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="La pregunta no puede estar vacía.")
 
@@ -69,11 +113,18 @@ def chat(request: ChatRequest):
     in_session_memory.add_message(request.session_id, "user", request.question)
     in_session_memory.add_message(request.session_id, "assistant", answer)
 
-    return ChatResponse(session_id=request.session_id, question=request.question, answer=answer)
+    return ChatResponse(
+        session_id=request.session_id,
+        question=request.question,
+        answer=answer,
+    )
 
 
 @app.post("/chat/persistent", response_model=ChatResponse, tags=["Agente - Memoria Persistente"])
-def chat_persistent(request: ChatRequest):
+def chat_persistent(
+    request: ChatRequest,
+    current_user: Annotated[User, Depends(get_current_user)]
+):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="La pregunta no puede estar vacía.")
 
@@ -87,11 +138,19 @@ def chat_persistent(request: ChatRequest):
     persistent_memory.add_message(request.session_id, "user", request.question)
     persistent_memory.add_message(request.session_id, "assistant", answer)
 
-    return ChatResponse(session_id=request.session_id, question=request.question, answer=answer)
+    return ChatResponse(
+        session_id=request.session_id,
+        question=request.question,
+        answer=answer,
+    )
 
 
 @app.get("/memory/{session_id}", tags=["Memoria"])
-def get_memory(session_id: str, persistent: bool = False):
+def get_memory(
+    session_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    persistent: bool = False
+):
     if persistent:
         history = persistent_memory.get_history_with_timestamps(session_id)
     else:
@@ -100,7 +159,11 @@ def get_memory(session_id: str, persistent: bool = False):
 
 
 @app.delete("/memory/{session_id}", tags=["Memoria"])
-def clear_memory(session_id: str, persistent: bool = False):
+def clear_memory(
+    session_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    persistent: bool = False
+):
     if persistent:
         persistent_memory.clear(session_id)
     else:
