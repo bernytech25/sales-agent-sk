@@ -1,6 +1,20 @@
 """
 Agente de análisis de ventas - Semantic Kernel + Azure OpenAI
-Con observabilidad via Azure Monitor / Application Insights (OpenTelemetry)
+
+Diferencias clave con LangGraph:
+- No hay grafo manual — SK maneja el loop automáticamente
+- Las tools se agrupan en un Plugin (clase)
+- FunctionChoiceBehavior.Auto() reemplaza el edge condicional
+- ChatHistory reemplaza el AgentState
+
+Flujo interno de SK:
+  [START] → LLM decide → ejecuta función → LLM decide → ... → respuesta final
+  (igual que LangGraph pero SK lo maneja internamente)
+
+Nota de migración: este archivo originalmente usaba Groq via el conector
+OpenAIChatCompletion (API compatible con OpenAI). La migración a Azure OpenAI
+solo cambió la sección de build_kernel() — el resto del agente (plugin, tools,
+manejo de historial, function calling) es exactamente el mismo código.
 """
 
 import os
@@ -19,41 +33,6 @@ from app.sales_plugin import SalesPlugin
 
 load_dotenv()
 
-# ── Configuración de Application Insights (OpenTelemetry) ────────────────────
-
-def setup_telemetry():
-    """
-    Configura OpenTelemetry para enviar trazas a Azure Application Insights.
-    Semantic Kernel instrumenta automáticamente:
-    - Cada invocación del agente
-    - Cada función/plugin llamado
-    - Tokens de entrada y salida
-    - Latencia por operación
-    """
-    connection_string = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
-    if not connection_string:
-        return  # Si no hay connection string, no falla — simplemente no trackea
-
-    try:
-        from azure.monitor.opentelemetry import configure_azure_monitor
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-
-        configure_azure_monitor(connection_string=connection_string)
-
-        # Habilitar instrumentación de Semantic Kernel
-        import semantic_kernel.utils.telemetry as sk_telemetry
-        if hasattr(sk_telemetry, 'setup_logging'):
-            sk_telemetry.setup_logging()
-
-        print("✅ Application Insights telemetry configured")
-    except Exception as e:
-        print(f"⚠️ Telemetry setup failed (non-critical): {e}")
-
-
-# Inicializar telemetría al importar el módulo
-setup_telemetry()
-
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Sos un asistente experto en análisis de ventas.
@@ -70,6 +49,14 @@ SERVICE_ID = "azure-openai"
 # ── Construcción del Kernel ───────────────────────────────────────────────────
 
 def build_kernel() -> Kernel:
+    """
+    Crea y configura el Kernel de Semantic Kernel conectado a Azure OpenAI.
+
+    Variables de entorno necesarias (.env):
+        AZURE_OPENAI_ENDPOINT     -> https://<tu-recurso>.openai.azure.com/
+        AZURE_OPENAI_KEY          -> Key 1 o Key 2 del recurso
+        AZURE_OPENAI_DEPLOYMENT   -> nombre del deployment (ej: gpt-4o-mini)
+    """
     kernel = Kernel()
 
     kernel.add_service(
@@ -82,6 +69,7 @@ def build_kernel() -> Kernel:
         )
     )
 
+    # Registrar el plugin con todas las tools (sin cambios respecto a Groq)
     kernel.add_plugin(SalesPlugin(), plugin_name="sales")
 
     return kernel
@@ -90,14 +78,28 @@ def build_kernel() -> Kernel:
 # ── Función pública ───────────────────────────────────────────────────────────
 
 async def run_agent_async(question: str, history: list[dict] | None = None) -> str:
+    """
+    Ejecuta el agente con una pregunta y retorna la respuesta.
+
+    Args:
+        question: Pregunta del usuario en lenguaje natural.
+        history: Historial previo [{"role": "user"|"assistant", "content": "..."}]
+
+    Returns:
+        Respuesta del agente en lenguaje natural.
+    """
     kernel = build_kernel()
 
+    # Configurar tool calling automático
+    # FunctionChoiceBehavior.Auto() = el LLM decide cuándo llamar tools
+    # Equivalente al edge condicional should_continue en LangGraph
     settings = OpenAIChatPromptExecutionSettings(
         service_id=SERVICE_ID,
         function_choice_behavior=FunctionChoiceBehavior.Auto(),
         temperature=0,
     )
 
+    # Construir historial de conversación
     chat_history = ChatHistory()
     chat_history.add_system_message(SYSTEM_PROMPT)
 
@@ -110,6 +112,7 @@ async def run_agent_async(question: str, history: list[dict] | None = None) -> s
 
     chat_history.add_user_message(question)
 
+    # Invocar el agente
     chat_service = kernel.get_service(SERVICE_ID)
     response = await chat_service.get_chat_message_content(
         chat_history=chat_history,
@@ -121,4 +124,9 @@ async def run_agent_async(question: str, history: list[dict] | None = None) -> s
 
 
 def run_agent(question: str, history: list[dict] | None = None) -> str:
+    """
+    Wrapper síncrono para usar en FastAPI.
+    FastAPI puede manejar async directamente pero este wrapper
+    facilita el testing y la compatibilidad.
+    """
     return asyncio.run(run_agent_async(question, history))
